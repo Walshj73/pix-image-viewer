@@ -3,6 +3,8 @@ Universal Image Viewer — Slideshow GUI
 Supports: .jpg .jpeg .png .tiff .tif .bmp .gif .webp .ico .ppm .pgm
           .raw .cr2 .nef .arw .dng .orf .rw2 .raf .pef .srw
           ENVI hyperspectral cubes (.hdr + .bil / .bsq / .bip / .img / .dat / .raw)
+          NumPy arrays (.npy) — 2-D greyscale, 3-D (H×W×C) RGB/RGBA,
+                                or hyperspectral cubes (H×W×bands, bands>4)
 Requires: pip install rawpy pillow numpy spectral
 """
 
@@ -50,9 +52,11 @@ CAMERA_RAW_EXTENSIONS = {
 PLAIN_RAW_EXTENSIONS = {".raw"}
 ENVI_HEADER_EXTENSIONS = {".hdr"}          # user opens the .hdr file
 ENVI_DATA_EXTENSIONS   = {".bil", ".bsq", ".bip", ".img", ".dat"}
+NPY_EXTENSIONS         = {".npy"}          # NumPy array files
 
 ALL_EXTENSIONS = (PILLOW_EXTENSIONS | CAMERA_RAW_EXTENSIONS |
-                  PLAIN_RAW_EXTENSIONS | ENVI_HEADER_EXTENSIONS)
+                  PLAIN_RAW_EXTENSIONS | ENVI_HEADER_EXTENSIONS |
+                  NPY_EXTENSIONS)
 
 # Stored plain-RAW settings so user only enters them once per session.
 _plain_raw_settings: dict = {}
@@ -185,6 +189,139 @@ def _norm_band(arr: np.ndarray) -> np.ndarray:
     return arr.astype(np.uint8)
 
 
+# ── NPY / NumPy array support ─────────────────────────────────────────────────
+
+def _npy_kind(arr: np.ndarray) -> str:
+    """
+    Classify an NPY array shape:
+      'grey'   — 2-D (H, W)
+      'rgb'    — 3-D (H, W, 3)
+      'rgba'   — 3-D (H, W, 4)
+      'hyper'  — 3-D (H, W, bands) where bands > 4
+    Raises ValueError for anything else.
+    """
+    if arr.ndim == 2:
+        return "grey"
+    if arr.ndim == 3:
+        bands = arr.shape[2]
+        if bands == 1:
+            return "grey"
+        if bands == 3:
+            return "rgb"
+        if bands == 4:
+            return "rgba"
+        return "hyper"
+    raise ValueError(
+        f"Cannot display NPY array with shape {arr.shape}. "
+        "Expected 2-D (H,W) or 3-D (H,W,C)."
+    )
+
+
+def get_npy_info(filepath: str) -> dict:
+    """Return metadata dict for an NPY file without loading the full array."""
+    arr = np.load(filepath, mmap_mode="r")
+    kind = _npy_kind(arr)
+    nbands = arr.shape[2] if arr.ndim == 3 else 1
+    return {
+        "rows":   arr.shape[0],
+        "cols":   arr.shape[1],
+        "bands":  nbands,
+        "kind":   kind,
+        "dtype":  str(arr.dtype),
+        "shape":  arr.shape,
+    }
+
+
+def load_npy_preview(filepath: str,
+                     r_idx: int, g_idx: int, b_idx: int) -> Image.Image:
+    """Load a hyperspectral NPY cube and return an RGB false-colour PIL image."""
+    arr = np.load(filepath, mmap_mode="r")
+    nbands = arr.shape[2]
+    r_idx = max(0, min(r_idx, nbands - 1))
+    g_idx = max(0, min(g_idx, nbands - 1))
+    b_idx = max(0, min(b_idx, nbands - 1))
+    rgb = np.stack([
+        _norm_band(arr[:, :, r_idx].astype(np.float32)),
+        _norm_band(arr[:, :, g_idx].astype(np.float32)),
+        _norm_band(arr[:, :, b_idx].astype(np.float32)),
+    ], axis=2)
+    return Image.fromarray(rgb, "RGB")
+
+
+def load_npy_band(filepath: str, band_idx: int) -> Image.Image:
+    """Return a single band from a hyperspectral NPY cube as a greyscale PIL image."""
+    arr = np.load(filepath, mmap_mode="r")
+    nbands = arr.shape[2]
+    band_idx = max(0, min(band_idx, nbands - 1))
+    band_arr = _norm_band(arr[:, :, band_idx].astype(np.float32))
+    return Image.fromarray(band_arr, "L").convert("RGB")
+
+
+def load_npy_image(filepath: str) -> Image.Image:
+    """
+    Load any NPY file and return a displayable PIL RGB image.
+    For hyperspectral cubes (bands > 4) returns a false-colour composite using
+    bands at 75 %, 50 %, 25 % of the band count as R, G, B.
+    """
+    arr = np.load(filepath)
+    kind = _npy_kind(arr)
+
+    if kind == "grey":
+        data = arr[:, :, 0] if arr.ndim == 3 else arr
+        return Image.fromarray(_norm_band(data.astype(np.float32)), "L").convert("RGB")
+
+    if kind == "rgb":
+        rgb = np.stack([_norm_band(arr[:, :, c].astype(np.float32))
+                        for c in range(3)], axis=2)
+        return Image.fromarray(rgb, "RGB")
+
+    if kind == "rgba":
+        rgba = np.stack([_norm_band(arr[:, :, c].astype(np.float32))
+                         for c in range(4)], axis=2)
+        pil = Image.fromarray(rgba, "RGBA")
+        bg  = Image.new("RGB", pil.size, (20, 20, 20))
+        bg.paste(pil, mask=pil.split()[3])
+        return bg
+
+    # hyper
+    nbands = arr.shape[2]
+    r, g, b = _estimate_rgb_bands(nbands, None)
+    return load_npy_preview(filepath, r, g, b)
+
+
+def _estimate_rgb_bands(nbands: int, wavelengths: list | None) -> tuple[int, int, int]:
+    """
+    Estimate the best R, G, B band indices for a natural-looking false-colour composite.
+
+    If wavelength metadata is available the function finds the bands closest to
+    canonical visible wavelengths (640 nm R, 550 nm G, 470 nm B).  This gives a
+    perceptually correct colour rendering for sensors that cover the visible range.
+
+    When no wavelength info exists (NPY cubes, ENVI without metadata) it falls back
+    to a geometric heuristic that spreads R/G/B across the upper, middle and lower
+    thirds of the band stack — better than 75/50/25 for sensors whose bands are not
+    evenly spaced in wavelength.
+    """
+    if wavelengths and len(wavelengths) >= 3:
+        wl = wavelengths
+        def nearest(target):
+            return min(range(len(wl)), key=lambda i: abs(wl[i] - target))
+        # Try canonical visible wavelengths first
+        r = nearest(640.0)
+        g = nearest(550.0)
+        b = nearest(470.0)
+        # If all three collapse to the same band (sensor outside visible range),
+        # fall back to geometric spread
+        if len({r, g, b}) == 3:
+            return r, g, b
+
+    # Geometric fallback — spread evenly across the band range
+    r = min(int(nbands * 0.75), nbands - 1)
+    g = min(int(nbands * 0.50), nbands - 1)
+    b = min(int(nbands * 0.25), nbands - 1)
+    return r, g, b
+
+
 def _find_envi_data_file_in_folder(hdr_path: str) -> str | None:
     """
     For folder loading only — find the paired ENVI data file next to the HDR
@@ -243,6 +380,109 @@ def get_envi_info(hdr_path: str, data_file: str) -> dict:
         "description": meta.get("description", ""),
         "data_file": data_file,
     }
+
+
+def _save_hq_pil(pil: Image.Image, parent, stem: str, title: str = "Save high-quality image"):
+    """
+    Prompt for a save path and write a PIL image at full resolution.
+    Offers 16-bit TIFF as the preferred lossless format; also PNG / JPEG.
+    """
+    out = filedialog.asksaveasfilename(
+        parent=parent,
+        title=title,
+        initialfile=f"{stem}_hq.tif",
+        defaultextension=".tif",
+        filetypes=[
+            ("16-bit TIFF (lossless)", "*.tif *.tiff"),
+            ("PNG  (lossless 8-bit)",  "*.png"),
+            ("JPEG (lossy)",           "*.jpg *.jpeg"),
+            ("All files",              "*.*"),
+        ],
+    )
+    if not out:
+        return
+    ext = Path(out).suffix.lower()
+    try:
+        if ext in (".tif", ".tiff"):
+            # Save as 16-bit greyscale or RGB TIFF
+            arr = np.array(pil.convert("RGB"))
+            arr16 = (arr.astype(np.uint16) * 257)   # 8-bit → 16-bit (0-255 → 0-65535)
+            img16 = Image.fromarray(arr16, mode="RGB")  # Pillow RGB 16-bit
+            img16.save(out, format="TIFF", compression="tiff_lzw")
+        elif ext in (".jpg", ".jpeg"):
+            pil.convert("RGB").save(out, format="JPEG", quality=97, subsampling=0)
+        else:
+            pil.save(out)
+        messagebox.showinfo("Saved", f"Saved to:\n{out}", parent=parent)
+    except Exception as exc:
+        messagebox.showerror("Save failed", str(exc), parent=parent)
+
+
+def _build_hq_npy_band(filepath: str, band_idx: int) -> Image.Image:
+    """
+    Return a full-resolution 16-bit-range greyscale PIL image for a single NPY band.
+    The raw float values are linearly scaled to 0-65535 and stored in a 16-bit
+    greyscale TIFF-compatible PIL image (mode 'I' / int32 with 16-bit range).
+    For display / save we keep it as uint16 in mode 'I;16'.
+    """
+    arr = np.load(filepath, mmap_mode="r")
+    nbands = arr.shape[2]
+    band_idx = max(0, min(band_idx, nbands - 1))
+    raw = arr[:, :, band_idx].astype(np.float32)
+    raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
+    lo, hi = raw.min(), raw.max()
+    if hi > lo:
+        scaled = ((raw - lo) / (hi - lo) * 65535.0).astype(np.uint16)
+    else:
+        scaled = np.zeros(raw.shape, dtype=np.uint16)
+    # PIL can save uint16 greyscale as 16-bit TIFF via mode 'I;16'
+    return Image.fromarray(scaled, mode="I;16")
+
+
+def _build_hq_npy_rgb(filepath: str, r_idx: int, g_idx: int, b_idx: int) -> Image.Image:
+    """
+    Return a full-resolution RGB PIL image from three NPY bands.
+    Each band is independently normalised to 0-255 (uint8) — same as the viewer
+    preview but without any downscaling, so it is truly the full-resolution composite.
+    """
+    arr = np.load(filepath, mmap_mode="r")
+    nbands = arr.shape[2]
+    r_idx = max(0, min(r_idx, nbands - 1))
+    g_idx = max(0, min(g_idx, nbands - 1))
+    b_idx = max(0, min(b_idx, nbands - 1))
+    rgb = np.stack([
+        _norm_band(arr[:, :, r_idx].astype(np.float32)),
+        _norm_band(arr[:, :, g_idx].astype(np.float32)),
+        _norm_band(arr[:, :, b_idx].astype(np.float32)),
+    ], axis=2)
+    return Image.fromarray(rgb, "RGB")
+
+
+def _build_hq_envi_band(hdr_path: str, data_file: str, band_idx: int) -> Image.Image:
+    """Return a full-resolution 16-bit greyscale PIL image for one ENVI band."""
+    img = envi.open(hdr_path, image=data_file)
+    nbands = img.shape[2]
+    band_idx = max(0, min(band_idx, nbands - 1))
+    raw = img.read_band(band_idx).astype(np.float32)
+    raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
+    lo, hi = raw.min(), raw.max()
+    if hi > lo:
+        scaled = ((raw - lo) / (hi - lo) * 65535.0).astype(np.uint16)
+    else:
+        scaled = np.zeros(raw.shape, dtype=np.uint16)
+    return Image.fromarray(scaled, mode="I;16")
+
+
+def _build_hq_envi_rgb(hdr_path: str, data_file: str,
+                        r_idx: int, g_idx: int, b_idx: int) -> Image.Image:
+    """Return a full-resolution RGB PIL image from three ENVI bands."""
+    img = envi.open(hdr_path, image=data_file)
+    nbands = img.shape[2]
+    def rb(i):
+        i = max(0, min(i, nbands - 1))
+        return _norm_band(img.read_band(i).astype(np.float32))
+    rgb = np.stack([rb(r_idx), rb(g_idx), rb(b_idx)], axis=2)
+    return Image.fromarray(rgb, "RGB")
 
 
 def load_image(filepath: str, parent_widget=None,
@@ -358,13 +598,12 @@ def load_image(filepath: str, parent_widget=None,
         if envi_bands is not None:
             r, g, b = envi_bands
         else:
-            if nbands >= 3:
-                r = min(int(nbands * 0.75), nbands - 1)
-                g = min(int(nbands * 0.50), nbands - 1)
-                b = min(int(nbands * 0.25), nbands - 1)
-            else:
-                r = g = b = 0
+            r, g, b = _estimate_rgb_bands(nbands, info.get("wavelengths"))
         return load_envi_preview(filepath, envi_data_file, r, g, b)
+
+    # NumPy .npy files
+    if ext in NPY_EXTENSIONS:
+        return load_npy_image(filepath)
 
     raise ValueError(f"Unsupported extension: {ext}")
 
@@ -384,6 +623,7 @@ class ImageViewer(tk.Tk):
         "STD":  PILLOW_EXTENSIONS,
         "CAM":  CAMERA_RAW_EXTENSIONS,
         "RAW":  PLAIN_RAW_EXTENSIONS,
+        "NPY":  NPY_EXTENSIONS,
     }
 
     def __init__(self):
@@ -417,6 +657,12 @@ class ImageViewer(tk.Tk):
         self._envi_data_files: dict  = {}   # hdr_path -> data_file_path
         self._envi_band_idx:   int   = 0    # current band slice shown by slider
         self._envi_slice_pil            = None  # PIL image of current band slice
+
+        # NPY hyperspectral state
+        self._npy_info:      dict  = {}
+        self._npy_bands:     tuple = None   # (r, g, b) indices for false-colour
+        self._npy_band_idx:  int   = 0      # current band slice for slider
+        self._npy_slice_pil          = None # PIL image of current NPY band slice
 
         # Lasso state
         self._lasso_points: list[tuple[int, int]] = []   # canvas coords
@@ -462,6 +708,12 @@ class ImageViewer(tk.Tk):
                                    padx=14, pady=6, bd=0)
         self.btn_lasso.pack(side="right", padx=4)
 
+        # ── Colour transform buttons ──────────────────────────────────────────────
+        tk.Button(top, text="NEG",    command=self._transform_negative,  **btn).pack(side="right", padx=4)
+        tk.Button(top, text="HSV",    command=self._transform_hsv,       **btn).pack(side="right", padx=4)
+        tk.Button(top, text="LAB",    command=self._transform_lab,        **btn).pack(side="right", padx=4)
+        tk.Button(top, text="ADJUST", command=self._open_adjust_window,  **btn).pack(side="right", padx=4)
+
         # ── Filter strip ──
         fbar = tk.Frame(self, bg=self.SURFACE, pady=6)
         fbar.pack(fill="x", padx=0)
@@ -478,6 +730,7 @@ class ImageViewer(tk.Tk):
             "CAM RAW": frozenset(CAMERA_RAW_EXTENSIONS),
             ".RAW":  frozenset(PLAIN_RAW_EXTENSIONS),
             "ENVI":  frozenset(ENVI_HEADER_EXTENSIONS),
+            "NPY":   frozenset(NPY_EXTENSIONS),
             "OTHER": frozenset(PILLOW_EXTENSIONS - {".jpg", ".jpeg", ".png", ".tiff", ".tif"}),
         }
         self._filter_map = filter_options
@@ -550,6 +803,73 @@ class ImageViewer(tk.Tk):
         self._envi_wl_lbl = tk.Label(ep, text="", font=("Courier New", 8),
                                       bg=self.SURFACE, fg=self.FG_DIM)
         self._envi_wl_lbl.pack(side="left", padx=6)
+
+        # HQ export buttons
+        tk.Button(ep, text="💾 HQ Slice",
+                  command=self._envi_save_hq_slice,
+                  bg=self.SURFACE, fg=self.ACCENT, relief="flat",
+                  font=("Courier New", 8, "bold"), cursor="hand2",
+                  activebackground=self.ACCENT, activeforeground=self.BG,
+                  padx=10, pady=3, bd=0).pack(side="left", padx=4)
+        tk.Button(ep, text="💾 HQ RGB",
+                  command=self._envi_save_hq_rgb,
+                  bg=self.SURFACE, fg=self.ACCENT, relief="flat",
+                  font=("Courier New", 8, "bold"), cursor="hand2",
+                  activebackground=self.ACCENT, activeforeground=self.BG,
+                  padx=10, pady=3, bd=0).pack(side="left", padx=(0, 6))
+
+        # ── NPY band-picker panel (hidden unless a hyperspectral NPY is loaded) ──
+        self._npy_panel = tk.Frame(self, bg=self.SURFACE, pady=6)
+        # Not packed yet — shown/hidden dynamically
+
+        np_panel = self._npy_panel
+        tk.Label(np_panel, text="NPY HYPERSPECTRAL", font=("Courier New", 8, "bold"),
+                 bg=self.SURFACE, fg=self.ACCENT).pack(side="left", padx=(12, 10))
+
+        self._npy_meta_lbl = tk.Label(np_panel, text="", font=("Courier New", 8),
+                                       bg=self.SURFACE, fg=self.FG_DIM)
+        self._npy_meta_lbl.pack(side="left", padx=(0, 14))
+
+        for ch, color in (("R", "#FF6B6B"), ("G", "#6BFF8E"), ("B", "#6BB5FF")):
+            tk.Label(np_panel, text=ch, font=("Courier New", 9, "bold"),
+                     bg=self.SURFACE, fg=color).pack(side="left", padx=(6, 2))
+            var = tk.IntVar(value=0)
+            setattr(self, f"_npy_{ch.lower()}_var", var)
+            sp = tk.Spinbox(np_panel, textvariable=var, from_=0, to=9999, width=5,
+                            font=("Courier New", 9), bg=self.BG, fg=self.FG,
+                            buttonbackground=self.SURFACE, relief="flat",
+                            insertbackground=self.ACCENT,
+                            command=self._npy_band_changed)
+            sp.bind("<Return>", lambda _: self._npy_band_changed())
+            sp.pack(side="left", padx=(0, 4))
+
+        tk.Button(np_panel, text="APPLY", command=self._npy_band_changed,
+                  bg=self.SURFACE, fg=self.ACCENT, relief="flat",
+                  font=("Courier New", 8, "bold"), cursor="hand2",
+                  activebackground=self.ACCENT, activeforeground=self.BG,
+                  padx=10, pady=3, bd=0).pack(side="left", padx=6)
+
+        # Greyscale single-band mode for NPY
+        self._npy_grey_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(np_panel, text="Single band (grey)", variable=self._npy_grey_var,
+                       command=self._npy_band_changed,
+                       bg=self.SURFACE, fg=self.FG_DIM,
+                       selectcolor=self.BG, activebackground=self.SURFACE,
+                       font=("Courier New", 8)).pack(side="left", padx=8)
+
+        # HQ export buttons
+        tk.Button(np_panel, text="💾 HQ Slice",
+                  command=self._npy_save_hq_slice,
+                  bg=self.SURFACE, fg=self.ACCENT, relief="flat",
+                  font=("Courier New", 8, "bold"), cursor="hand2",
+                  activebackground=self.ACCENT, activeforeground=self.BG,
+                  padx=10, pady=3, bd=0).pack(side="left", padx=4)
+        tk.Button(np_panel, text="💾 HQ RGB",
+                  command=self._npy_save_hq_rgb,
+                  bg=self.SURFACE, fg=self.ACCENT, relief="flat",
+                  font=("Courier New", 8, "bold"), cursor="hand2",
+                  activebackground=self.ACCENT, activeforeground=self.BG,
+                  padx=10, pady=3, bd=0).pack(side="left", padx=(0, 6))
 
         # ── Bottom bar ──
         bottom = tk.Frame(self, bg=self.SURFACE, pady=10)
@@ -699,6 +1019,7 @@ class ImageViewer(tk.Tk):
                 ("Camera RAW",           "*.cr2 *.nef *.arw *.dng *.orf *.rw2 *.raf *.pef *.srw"),
                 ("Plain RAW",            "*.raw"),
                 ("ENVI Hyperspectral",   "*.hdr"),
+                ("NumPy Array",          "*.npy"),
                 ("All files",            "*.*"),
             ]
         )
@@ -762,15 +1083,27 @@ class ImageViewer(tk.Tk):
             return False
         return Path(self.files[self.index]).suffix.lower() in ENVI_HEADER_EXTENSIONS
 
+    def _is_npy_hyper_active(self) -> bool:
+        """True when the current file is a hyperspectral NPY cube."""
+        if not self.files:
+            return False
+        if Path(self.files[self.index]).suffix.lower() not in NPY_EXTENSIONS:
+            return False
+        return self._npy_info.get("kind") == "hyper"
+
     def _prev(self):
         if self._is_envi_active():
             self._envi_go_band(self._envi_band_idx - 1)
+        elif self._is_npy_hyper_active():
+            self._npy_go_band(self._npy_band_idx - 1)
         elif self.files:
             self._go(self.index - 1)
 
     def _next(self):
         if self._is_envi_active():
             self._envi_go_band(self._envi_band_idx + 1)
+        elif self._is_npy_hyper_active():
+            self._npy_go_band(self._npy_band_idx + 1)
         elif self.files:
             self._go(self.index + 1)
 
@@ -786,6 +1119,9 @@ class ImageViewer(tk.Tk):
         if self._is_envi_active():
             if idx != self._envi_band_idx:
                 self._envi_go_band(idx, from_slider=True)
+        elif self._is_npy_hyper_active():
+            if idx != self._npy_band_idx:
+                self._npy_go_band(idx, from_slider=True)
         elif self.files and idx != self.index:
             self.index = idx
             self._show_image()
@@ -850,8 +1186,10 @@ class ImageViewer(tk.Tk):
 
         # Show/hide ENVI panel
         is_envi = ext in ENVI_HEADER_EXTENSIONS
+        is_npy  = ext in NPY_EXTENSIONS
         if is_envi:
             self._envi_panel.pack(fill="x", before=self.canvas)
+            self._npy_panel.pack_forget()
             envi_data = self._envi_data_files.get(path)
             if not envi_data:
                 self.canvas.delete("all")
@@ -870,11 +1208,52 @@ class ImageViewer(tk.Tk):
             self.slider_var.set(0)
             self.lbl_count.config(text=f"1 / {nbands}")
             self._setup_envi_panel(path)
-        else:
+        elif is_npy:
             self._envi_panel.pack_forget()
             self._envi_info      = {}
             self._envi_bands     = None
             self._envi_slice_pil = None
+            # Load NPY metadata
+            try:
+                self._npy_info = get_npy_info(path)
+            except Exception as exc:
+                self._npy_panel.pack_forget()
+                self.canvas.delete("all")
+                cw = max(self.canvas.winfo_width(), 100)
+                ch = max(self.canvas.winfo_height(), 100)
+                self.canvas.create_text(cw // 2, ch // 2,
+                                        text=f"⚠  Cannot read NPY file\n{exc}",
+                                        font=("Courier New", 11), fill="#FF5555",
+                                        justify="center")
+                return
+            if self._npy_info.get("kind") == "hyper":
+                # Hyperspectral — show band panel and configure slider
+                self._npy_panel.pack(fill="x", before=self.canvas)
+                self._npy_band_idx  = 0
+                self._npy_slice_pil = None
+                self._npy_bands     = None
+                nbands = self._npy_info.get("bands", 1)
+                self.slider.config(to=max(0, nbands - 1))
+                self.slider_var.set(0)
+                self.lbl_count.config(text=f"1 / {nbands}")
+                self._setup_npy_panel(path)
+            else:
+                # Simple 2-D or RGB NPY — hide panel, slider stays on files
+                self._npy_panel.pack_forget()
+                self._npy_info      = {}
+                self._npy_bands     = None
+                self._npy_slice_pil = None
+                self.slider.config(to=max(0, len(self.files) - 1))
+                self.slider_var.set(self.index)
+        else:
+            self._envi_panel.pack_forget()
+            self._npy_panel.pack_forget()
+            self._envi_info      = {}
+            self._envi_bands     = None
+            self._envi_slice_pil = None
+            self._npy_info       = {}
+            self._npy_bands      = None
+            self._npy_slice_pil  = None
             # Restore slider to file range
             self.slider.config(to=max(0, len(self.files) - 1))
             self.slider_var.set(self.index)
@@ -911,6 +1290,9 @@ class ImageViewer(tk.Tk):
         if is_envi:
             info = self._envi_info
             extra = f"  ·  {info.get('bands','?')} bands  [{info.get('interleave','?')}]"
+        elif is_npy and self._npy_info:
+            info = self._npy_info
+            extra = f"  ·  {info.get('bands','?')} bands  [{info.get('dtype','?')}]"
         self.lbl_size.config(text=f"{pil.width}×{pil.height}  ·  {size_str}{extra}")
 
         self._redraw()
@@ -928,14 +1310,9 @@ class ImageViewer(tk.Tk):
             # clamp existing value
             sp_var.set(min(sp_var.get(), nbands - 1))
 
-        # Default RGB if bands not yet set
+        # Default RGB using wavelength-aware estimation
         if self._envi_bands is None:
-            if nbands >= 3:
-                r = min(int(nbands * 0.75), nbands - 1)
-                g = min(int(nbands * 0.50), nbands - 1)
-                b = min(int(nbands * 0.25), nbands - 1)
-            else:
-                r = g = b = 0
+            r, g, b = _estimate_rgb_bands(nbands, info.get("wavelengths"))
             self._envi_r_var.set(r)
             self._envi_g_var.set(g)
             self._envi_b_var.set(b)
@@ -1005,6 +1382,190 @@ class ImageViewer(tk.Tk):
             self._redraw()
         except Exception as exc:
             messagebox.showerror("ENVI error", str(exc))
+
+    # ── NPY band scrubbing ────────────────────────────────────────────────────
+
+    def _npy_go_band(self, band_idx: int, from_slider: bool = False):
+        """Render a single greyscale band slice from a hyperspectral NPY cube."""
+        info   = self._npy_info
+        nbands = info.get("bands", 1)
+        band_idx = max(0, min(band_idx, nbands - 1))
+        self._npy_band_idx = band_idx
+
+        if not from_slider:
+            self.slider_var.set(band_idx)
+
+        self.lbl_count.config(text=f"{band_idx + 1} / {nbands}")
+        self.lbl_name.config(text=f"Band {band_idx}")
+        path = self.files[self.index]
+        self.title(f"Image Viewer — {Path(path).name}  [Band {band_idx}]")
+
+        try:
+            pil = load_npy_band(path, band_idx)
+        except Exception as exc:
+            messagebox.showerror("NPY error", str(exc))
+            return
+
+        self._npy_slice_pil = pil
+        self._redraw()
+
+    def _npy_band_changed(self):
+        """Called when user changes the NPY RGB spinboxes or grey checkbox."""
+        if not self.files:
+            return
+        path = self.files[self.index]
+        if Path(path).suffix.lower() not in NPY_EXTENSIONS:
+            return
+
+        info   = self._npy_info
+        nbands = info.get("bands", 1)
+        grey   = self._npy_grey_var.get()
+
+        r = max(0, min(self._npy_r_var.get(), nbands - 1))
+        g = max(0, min(self._npy_g_var.get(), nbands - 1))
+        b = max(0, min(self._npy_b_var.get(), nbands - 1))
+
+        try:
+            if grey:
+                pil = load_npy_band(path, r)
+            else:
+                pil = load_npy_preview(path, r, g, b)
+            self._npy_bands = (r, g, b)
+            self._pil_cache[self.index] = pil
+            self._redraw()
+        except Exception as exc:
+            messagebox.showerror("NPY error", str(exc))
+
+    def _setup_npy_panel(self, filepath: str):
+        """Populate the NPY panel spinboxes and metadata label."""
+        info   = self._npy_info
+        nbands = info.get("bands", 1)
+        shape  = info.get("shape", ())
+
+        # Default false-colour band selection (geometric — no wavelength metadata)
+        if self._npy_bands is None:
+            r, g, b = _estimate_rgb_bands(nbands, None)
+            self._npy_r_var.set(r)
+            self._npy_g_var.set(g)
+            self._npy_b_var.set(b)
+            self._npy_bands = (r, g, b)
+        else:
+            for ch, idx in zip(("r", "g", "b"), self._npy_bands):
+                getattr(self, f"_npy_{ch}_var").set(min(idx, nbands - 1))
+
+        meta_str = (f"{info.get('rows','?')} × {info.get('cols','?')} × "
+                    f"{nbands} bands  |  {info.get('dtype','?')}")
+        self._npy_meta_lbl.config(text=meta_str)
+
+    # ── High-quality export ───────────────────────────────────────────────────
+
+    def _npy_save_hq_slice(self):
+        """Save the currently displayed NPY band as a 16-bit TIFF at full resolution."""
+        if not self._is_npy_hyper_active():
+            return
+        path  = self.files[self.index]
+        stem  = Path(path).stem
+        band  = self._npy_band_idx
+        try:
+            pil16 = _build_hq_npy_band(path, band)
+        except Exception as exc:
+            messagebox.showerror("Export error", str(exc))
+            return
+        out = filedialog.asksaveasfilename(
+            parent=self,
+            title=f"Save HQ band {band}",
+            initialfile=f"{stem}_band{band:04d}_hq.tif",
+            defaultextension=".tif",
+            filetypes=[
+                ("16-bit TIFF (lossless)", "*.tif *.tiff"),
+                ("PNG  (8-bit)",           "*.png"),
+                ("All files",              "*.*"),
+            ],
+        )
+        if not out:
+            return
+        try:
+            ext = Path(out).suffix.lower()
+            if ext in (".tif", ".tiff"):
+                pil16.save(out, format="TIFF", compression="tiff_lzw")
+            else:
+                # Convert 16-bit grey → 8-bit for PNG
+                arr = np.array(pil16, dtype=np.uint16)
+                pil8 = Image.fromarray((arr >> 8).astype(np.uint8), "L")
+                pil8.save(out)
+            messagebox.showinfo("Saved", f"Saved band {band} to:\n{out}")
+        except Exception as exc:
+            messagebox.showerror("Save failed", str(exc))
+
+    def _npy_save_hq_rgb(self):
+        """Save the current NPY false-colour RGB composite at full resolution."""
+        if not self._is_npy_hyper_active():
+            return
+        path = self.files[self.index]
+        stem = Path(path).stem
+        r, g, b = self._npy_bands or _estimate_rgb_bands(
+            self._npy_info.get("bands", 1), None)
+        try:
+            pil = _build_hq_npy_rgb(path, r, g, b)
+        except Exception as exc:
+            messagebox.showerror("Export error", str(exc))
+            return
+        _save_hq_pil(pil, self, f"{stem}_rgb_B{r}-{g}-{b}")
+
+    def _envi_save_hq_slice(self):
+        """Save the currently displayed ENVI band as a 16-bit TIFF at full resolution."""
+        if not self._is_envi_active():
+            return
+        path      = self.files[self.index]
+        data_file = self._envi_info.get("data_file")
+        stem      = Path(path).stem
+        band      = self._envi_band_idx
+        try:
+            pil16 = _build_hq_envi_band(path, data_file, band)
+        except Exception as exc:
+            messagebox.showerror("Export error", str(exc))
+            return
+        out = filedialog.asksaveasfilename(
+            parent=self,
+            title=f"Save HQ band {band}",
+            initialfile=f"{stem}_band{band:04d}_hq.tif",
+            defaultextension=".tif",
+            filetypes=[
+                ("16-bit TIFF (lossless)", "*.tif *.tiff"),
+                ("PNG  (8-bit)",           "*.png"),
+                ("All files",              "*.*"),
+            ],
+        )
+        if not out:
+            return
+        try:
+            ext = Path(out).suffix.lower()
+            if ext in (".tif", ".tiff"):
+                pil16.save(out, format="TIFF", compression="tiff_lzw")
+            else:
+                arr = np.array(pil16, dtype=np.uint16)
+                pil8 = Image.fromarray((arr >> 8).astype(np.uint8), "L")
+                pil8.save(out)
+            messagebox.showinfo("Saved", f"Saved band {band} to:\n{out}")
+        except Exception as exc:
+            messagebox.showerror("Save failed", str(exc))
+
+    def _envi_save_hq_rgb(self):
+        """Save the current ENVI false-colour RGB composite at full resolution."""
+        if not self._is_envi_active():
+            return
+        path      = self.files[self.index]
+        data_file = self._envi_info.get("data_file")
+        stem      = Path(path).stem
+        r = self._envi_r_var.get()
+        g = self._envi_g_var.get()
+        b = self._envi_b_var.get()
+        try:
+            pil = _build_hq_envi_rgb(path, data_file, r, g, b)
+        except Exception as exc:
+            messagebox.showerror("Export error", str(exc))
+            return
+        _save_hq_pil(pil, self, f"{stem}_rgb_B{r}-{g}-{b}")
 
     @staticmethod
     def _fit_size(iw: int, ih: int, max_w: int, max_h: int) -> tuple[int, int]:
@@ -1277,6 +1838,371 @@ class ImageViewer(tk.Tk):
                                  "Try 'Save crop…' instead.")
         self._lasso_clear()
 
+    # ── Colour-space transforms ───────────────────────────────────────────────
+
+    def _is_rgb_image(self) -> bool:
+        """Return True only for standard Pillow-loaded images (not ENVI/NPY hyper slices)."""
+        if not self.files:
+            return False
+        ext = Path(self.files[self.index]).suffix.lower()
+        if ext in PILLOW_EXTENSIONS | CAMERA_RAW_EXTENSIONS | PLAIN_RAW_EXTENSIONS:
+            return True
+        # Allow simple (grey / rgb / rgba) NPY files, but not hyperspectral cubes
+        if ext in NPY_EXTENSIONS:
+            return self._npy_info.get("kind", "hyper") != "hyper"
+        return False
+
+    def _transform_negative(self):
+        """Display the photographic negative of the current image."""
+        if not self._is_rgb_image():
+            messagebox.showwarning("Not supported",
+                "Negative is only available for standard RGB images (PNG, JPG, etc.).")
+            return
+        pil = self._pil_cache.get(self.index)
+        if pil is None:
+            return
+        import numpy as np
+        arr = np.array(pil.convert("RGB"), dtype=np.uint8)
+        neg = 255 - arr
+        self._show_transformed(Image.fromarray(neg, "RGB"), "NEGATIVE")
+
+    def _transform_hsv(self):
+        """Split image into H, S, V greyscale channels and show them side by side."""
+        if not self._is_rgb_image():
+            messagebox.showwarning("Not supported",
+                "HSV conversion is only available for standard RGB images.")
+            return
+        pil = self._pil_cache.get(self.index)
+        if pil is None:
+            return
+        arr = np.array(pil.convert("RGB"), dtype=np.float32) / 255.0
+        r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
+        cmax  = np.max(arr, axis=2)
+        cmin  = np.min(arr, axis=2)
+        delta = cmax - cmin
+
+        # Value
+        V = cmax
+
+        # Saturation — guard against divide-by-zero where cmax == 0
+        with np.errstate(invalid="ignore", divide="ignore"):
+            S = np.where(cmax > 0, delta / cmax, 0.0)
+
+        # Hue (0–360 → 0–255)
+        H = np.zeros_like(cmax)
+        m  = delta > 0
+        mr = m & (cmax == r)
+        mg = m & (cmax == g)
+        mb = m & (cmax == b)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            H[mr] = (60.0 * ((g[mr] - b[mr]) / delta[mr])) % 360.0
+            H[mg] = (60.0 * ((b[mg] - r[mg]) / delta[mg]) + 120.0) % 360.0
+            H[mb] = (60.0 * ((r[mb] - g[mb]) / delta[mb]) + 240.0) % 360.0
+        H = (H / 360.0 * 255.0).astype(np.uint8)
+        S = (np.clip(S, 0.0, 1.0) * 255.0).astype(np.uint8)
+        V = (np.clip(V, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+        channels = [
+            ("H  (Hue)",        Image.fromarray(H, "L")),
+            ("S  (Saturation)", Image.fromarray(S, "L")),
+            ("V  (Value)",      Image.fromarray(V, "L")),
+        ]
+        self._show_channels("HSV", channels)
+
+    def _transform_lab(self):
+        """Split image into L*, a*, b* greyscale channels and show them side by side."""
+        if not self._is_rgb_image():
+            messagebox.showwarning("Not supported",
+                "LAB conversion is only available for standard RGB images.")
+            return
+        pil = self._pil_cache.get(self.index)
+        if pil is None:
+            return
+        arr = np.array(pil.convert("RGB"), dtype=np.float32) / 255.0
+        # Linearise sRGB
+        mask = arr > 0.04045
+        arr[mask]  = ((arr[mask] + 0.055) / 1.055) ** 2.4
+        arr[~mask] = arr[~mask] / 12.92
+        # sRGB → XYZ (D65)
+        M = np.array([[0.4124564, 0.3575761, 0.1804375],
+                      [0.2126729, 0.7151522, 0.0721750],
+                      [0.0193339, 0.1191920, 0.9503041]])
+        xyz = arr @ M.T
+        xyz /= np.array([0.95047, 1.00000, 1.08883])
+        # XYZ → L*a*b*
+        eps, kap = 0.008856, 903.3
+        with np.errstate(invalid="ignore"):
+            fx = np.where(xyz > eps, xyz ** (1.0 / 3.0), (kap * xyz + 16.0) / 116.0)
+        L_ch = 116.0 * fx[..., 1] - 16.0          # 0–100
+        a_ch = 500.0 * (fx[..., 0] - fx[..., 1])  # ~-128 to +127
+        b_ch = 200.0 * (fx[..., 1] - fx[..., 2])  # ~-128 to +127
+
+        def stretch(ch):
+            lo, hi = ch.min(), ch.max()
+            if hi > lo:
+                ch = (ch - lo) / (hi - lo) * 255.0
+            else:
+                ch = np.zeros_like(ch)
+            return ch.astype(np.uint8)
+
+        channels = [
+            ("L*  (Lightness)",   Image.fromarray(stretch(L_ch), "L")),
+            ("a*  (Green→Red)",   Image.fromarray(stretch(a_ch), "L")),
+            ("b*  (Blue→Yellow)", Image.fromarray(stretch(b_ch), "L")),
+        ]
+        self._show_channels("LAB", channels)
+
+    def _show_transformed(self, img: "Image.Image", label: str):
+        """Single-image popup (used by NEG and any other single-result transforms)."""
+        win = tk.Toplevel(self)
+        win.title(f"{label} — {Path(self.files[self.index]).name}")
+        win.configure(bg=self.BG)
+        max_w, max_h = 900, 700
+        w, h = img.size
+        scale = min(max_w / w, max_h / h, 1.0)
+        disp  = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+        photo = ImageTk.PhotoImage(disp)
+        lbl = tk.Label(win, image=photo, bg=self.BG)
+        lbl.image = photo
+        lbl.pack(padx=12, pady=12)
+        btn_style = dict(bg=self.SURFACE, fg=self.FG, relief="flat",
+                         font=("Courier New", 10), cursor="hand2",
+                         activebackground=self.ACCENT, activeforeground=self.BG,
+                         padx=14, pady=6, bd=0)
+        bar = tk.Frame(win, bg=self.BG)
+        bar.pack(pady=(0, 10))
+        def save_it():
+            src = Path(self.files[self.index])
+            out = filedialog.asksaveasfilename(
+                title=f"Save {label}", initialfile=f"{src.stem}_{label.lower()}.png",
+                defaultextension=".png",
+                filetypes=[("PNG", "*.png"), ("JPEG", "*.jpg"), ("All files", "*.*")])
+            if out:
+                (img.convert("RGB") if Path(out).suffix.lower() in (".jpg", ".jpeg") else img).save(out)
+                messagebox.showinfo("Saved", f"Saved to:\n{out}")
+        tk.Button(bar, text="💾  Save…", command=save_it, **btn_style).pack(side="left", padx=6)
+        tk.Button(bar, text="✕  Close", command=win.destroy,
+                  bg=self.SURFACE, fg="#FF5555", relief="flat",
+                  font=("Courier New", 10), cursor="hand2",
+                  activebackground="#FF5555", activeforeground=self.BG,
+                  padx=14, pady=6, bd=0).pack(side="left", padx=6)
+
+    def _show_channels(self, label: str, channels: list):
+        """
+        Popup showing 3 greyscale channel images side by side.
+        channels: list of (name, PIL.Image in mode "L") tuples.
+        """
+        win = tk.Toplevel(self)
+        src_name = Path(self.files[self.index]).name
+        win.title(f"{label} Channels — {src_name}")
+        win.configure(bg=self.BG)
+        win.resizable(True, True)
+
+        tk.Label(win, text=f"{label}  CHANNEL  SPLIT",
+                 font=("Courier New", 13, "bold"), bg=self.BG, fg=self.ACCENT).pack(pady=(14, 2))
+        tk.Label(win, text=src_name, font=("Courier New", 8),
+                 bg=self.BG, fg=self.FG_DIM).pack(pady=(0, 10))
+
+        img_frame = tk.Frame(win, bg=self.BG)
+        img_frame.pack(padx=16, pady=4)
+
+        thumb_max  = 360
+        photo_refs = []
+
+        def make_thumb(img):
+            w, h  = img.size
+            scale = min(thumb_max / w, thumb_max / h, 1.0)
+            disp  = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+            ph    = ImageTk.PhotoImage(disp)
+            photo_refs.append(ph)
+            return ph
+
+        def save_one(ch_img, ch_name):
+            stem = Path(self.files[self.index]).stem
+            safe = ch_name.split()[0].replace("*", "").lower()
+            out  = filedialog.asksaveasfilename(
+                title=f"Save {ch_name}",
+                initialfile=f"{stem}_{label.lower()}_{safe}.png",
+                defaultextension=".png",
+                filetypes=[("PNG", "*.png"), ("JPEG", "*.jpg"), ("All files", "*.*")])
+            if out:
+                ext = Path(out).suffix.lower()
+                (ch_img.convert("RGB") if ext in (".jpg", ".jpeg") else ch_img).save(out)
+                messagebox.showinfo("Saved", f"Saved:\n{out}")
+
+        def save_all():
+            folder = filedialog.askdirectory(title="Choose folder to save all channels")
+            if not folder:
+                return
+            stem  = Path(self.files[self.index]).stem
+            saved = []
+            for ch_name, ch_img in channels:
+                safe = ch_name.split()[0].replace("*", "").lower()
+                out  = str(Path(folder) / f"{stem}_{label.lower()}_{safe}.png")
+                ch_img.save(out)
+                saved.append(out)
+            messagebox.showinfo("Saved All", "Saved:\n" + "\n".join(saved))
+
+        btn_s = dict(bg=self.SURFACE, fg=self.FG, relief="flat",
+                     font=("Courier New", 9), cursor="hand2",
+                     activebackground=self.ACCENT, activeforeground=self.BG,
+                     padx=10, pady=5, bd=0)
+
+        for ch_name, ch_img in channels:
+            col = tk.Frame(img_frame, bg=self.BG)
+            col.pack(side="left", padx=10)
+            tk.Label(col, text=ch_name, font=("Courier New", 10, "bold"),
+                     bg=self.BG, fg=self.ACCENT).pack(pady=(0, 4))
+            tk.Label(col, image=make_thumb(ch_img), bg=self.BORDER,
+                     relief="flat", borderwidth=1).pack()
+            tk.Button(col, text="💾  Save",
+                      command=lambda i=ch_img, n=ch_name: save_one(i, n),
+                      **btn_s).pack(pady=(8, 0))
+
+        bar = tk.Frame(win, bg=self.BG)
+        bar.pack(pady=14)
+        tk.Button(bar, text="💾  Save All", command=save_all,
+                  bg=self.ACCENT, fg=self.BG, relief="flat",
+                  font=("Courier New", 10, "bold"), cursor="hand2",
+                  activebackground=self.FG, activeforeground=self.BG,
+                  padx=16, pady=7, bd=0).pack(side="left", padx=8)
+        tk.Button(bar, text="✕  Close", command=win.destroy,
+                  bg=self.SURFACE, fg="#FF5555", relief="flat",
+                  font=("Courier New", 10), cursor="hand2",
+                  activebackground="#FF5555", activeforeground=self.BG,
+                  padx=16, pady=7, bd=0).pack(side="left", padx=8)
+
+        win._photo_refs = photo_refs
+
+    # ── Brightness / Contrast / Saturation adjustment window ──────────────────
+
+    def _open_adjust_window(self):
+        """Live adjustment popup: Brightness, Contrast, Saturation sliders."""
+        if not self._is_rgb_image():
+            messagebox.showwarning("Not supported",
+                "Adjustments are only available for standard RGB images.")
+            return
+        pil = self._pil_cache.get(self.index)
+        if pil is None:
+            return
+
+        from PIL import ImageEnhance
+
+        win = tk.Toplevel(self)
+        src_name = Path(self.files[self.index]).name
+        win.title(f"Adjust — {src_name}")
+        win.configure(bg=self.BG)
+        win.resizable(False, False)
+
+        # ── Preview ──
+        PREV_MAX = 520
+        orig = pil.convert("RGB")
+        ow, oh = orig.size
+        prev_scale = min(PREV_MAX / ow, PREV_MAX / oh, 1.0)
+        prev_w = max(1, int(ow * prev_scale))
+        prev_h = max(1, int(oh * prev_scale))
+        orig_small = orig.resize((prev_w, prev_h), Image.LANCZOS)  # base for re-apply
+
+        preview_lbl = tk.Label(win, bg=self.BG)
+        preview_lbl.pack(padx=16, pady=(14, 6))
+        _prev_photo = [None]   # mutable container to avoid GC
+
+        def refresh_preview(*_):
+            br  = brightness_var.get() / 100.0   # 1.0 = neutral
+            con = contrast_var.get()   / 100.0
+            sat = saturation_var.get() / 100.0
+            img = orig_small.copy()
+            img = ImageEnhance.Brightness(img).enhance(br)
+            img = ImageEnhance.Contrast(img).enhance(con)
+            img = ImageEnhance.Color(img).enhance(sat)
+            ph  = ImageTk.PhotoImage(img)
+            _prev_photo[0] = ph
+            preview_lbl.config(image=ph)
+
+        # ── Slider panel ──
+        panel = tk.Frame(win, bg=self.SURFACE, padx=20, pady=14)
+        panel.pack(fill="x", padx=16, pady=(0, 6))
+
+        slider_cfg = dict(
+            orient="horizontal", length=380,
+            bg=self.SURFACE, fg=self.FG, troughcolor=self.BORDER,
+            highlightthickness=0, sliderrelief="flat",
+            activebackground=self.ACCENT, showvalue=False, bd=0,
+        )
+        label_cfg  = dict(bg=self.SURFACE, fg=self.FG, font=("Courier New", 10), width=14, anchor="w")
+        val_cfg    = dict(bg=self.SURFACE, fg=self.ACCENT, font=("Courier New", 10, "bold"), width=5)
+
+        def make_slider(row, name, var, lo, hi, neutral):
+            tk.Label(panel, text=name, **label_cfg).grid(row=row, column=0, pady=6, sticky="w")
+            val_lbl = tk.Label(panel, text=f"{neutral:+.0f}%", **val_cfg)
+            val_lbl.grid(row=row, column=2, padx=(10, 0))
+            def on_change(*_):
+                pct = var.get() - neutral
+                val_lbl.config(text=f"{pct:+.0f}%")
+                refresh_preview()
+            sl = tk.Scale(panel, variable=var, from_=lo, to=hi,
+                          command=on_change, **slider_cfg)
+            sl.grid(row=row, column=1, padx=(10, 0))
+            # Double-click to reset
+            sl.bind("<Double-Button-1>", lambda _e, v=var, n=neutral: (v.set(n), refresh_preview()))
+            return sl
+
+        # Variables — all centred on 100 (= "no change")
+        brightness_var  = tk.IntVar(value=100)
+        contrast_var    = tk.IntVar(value=100)
+        saturation_var  = tk.IntVar(value=100)
+
+        make_slider(0, "☀  Brightness",  brightness_var,   10, 300, 100)
+        make_slider(1, "◑  Contrast",    contrast_var,     10, 300, 100)
+        make_slider(2, "◈  Saturation",  saturation_var,   0,  300, 100)
+
+        tk.Label(panel, text="(double-click any slider to reset)",
+                 font=("Courier New", 7), bg=self.SURFACE,
+                 fg=self.FG_DIM).grid(row=3, column=0, columnspan=3, pady=(4, 0), sticky="w")
+
+        # ── Buttons ──
+        bar = tk.Frame(win, bg=self.BG)
+        bar.pack(pady=12)
+
+        btn_s = dict(relief="flat", font=("Courier New", 10), cursor="hand2",
+                     padx=16, pady=7, bd=0)
+
+        def reset_all():
+            brightness_var.set(100)
+            contrast_var.set(100)
+            saturation_var.set(100)
+            refresh_preview()
+
+        def apply_to_full():
+            """Render the adjustments at full resolution and save to file."""
+            br  = brightness_var.get() / 100.0
+            con = contrast_var.get()   / 100.0
+            sat = saturation_var.get() / 100.0
+            img = orig.copy()
+            img = ImageEnhance.Brightness(img).enhance(br)
+            img = ImageEnhance.Contrast(img).enhance(con)
+            img = ImageEnhance.Color(img).enhance(sat)
+            stem = Path(self.files[self.index]).stem
+            out  = filedialog.asksaveasfilename(
+                title="Save adjusted image",
+                initialfile=f"{stem}_adjusted.png",
+                defaultextension=".png",
+                filetypes=[("PNG", "*.png"), ("JPEG", "*.jpg"), ("All files", "*.*")])
+            if out:
+                ext = Path(out).suffix.lower()
+                (img.convert("RGB") if ext in (".jpg", ".jpeg") else img).save(out)
+                messagebox.showinfo("Saved", f"Saved to:\n{out}")
+
+        tk.Button(bar, text="↺  Reset",   command=reset_all,
+                  bg=self.SURFACE, fg=self.FG, **btn_s).pack(side="left", padx=6)
+        tk.Button(bar, text="💾  Save…",  command=apply_to_full,
+                  bg=self.ACCENT,  fg=self.BG, **btn_s).pack(side="left", padx=6)
+        tk.Button(bar, text="✕  Close",   command=win.destroy,
+                  bg=self.SURFACE, fg="#FF5555", **btn_s).pack(side="left", padx=6)
+
+        # Draw initial preview
+        refresh_preview()
+
     # ── Rendering ─────────────────────────────────────────────────────────────
 
     def _redraw(self):
@@ -1286,9 +2212,13 @@ class ImageViewer(tk.Tk):
         cw = max(self.canvas.winfo_width(),  100)
         ch = max(self.canvas.winfo_height(), 100)
 
-        # In ENVI band-scrub mode use the slice; otherwise use the RGB composite cache
+        # In ENVI band-scrub mode use the slice;
+        # in NPY hyper band-scrub mode use the NPY slice;
+        # otherwise use the RGB composite cache
         if self._is_envi_active() and self._envi_slice_pil is not None:
             pil = self._envi_slice_pil
+        elif self._is_npy_hyper_active() and self._npy_slice_pil is not None:
+            pil = self._npy_slice_pil
         else:
             pil = self._pil_cache.get(self.index)
         if pil is None:
